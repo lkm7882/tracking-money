@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-import time  # 🚨 신규 추가: API 호출 딜레이 제어용
+import time
 import plotly.express as px
 import plotly.graph_objects as go
 import FinanceDataReader as fdr
@@ -20,6 +20,7 @@ def get_kis_token(app_key, app_secret):
 
 @st.cache_data(ttl=600)
 def get_ranking_data(token, app_key, app_secret, investor_type, action_type):
+    time.sleep(0.6) # 🚨 방어막: 초당 1건 제한(Rate Limit) 회피
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/foreign-institution-total"
     headers = {
         "content-type": "application/json; charset=utf-8", "authorization": f"Bearer {token}",
@@ -30,13 +31,18 @@ def get_ranking_data(token, app_key, app_secret, investor_type, action_type):
         "FID_DIV_CLS_CODE": "0", "FID_RANK_SORT_CLS_CODE": action_type, "FID_ETC_CLS_CODE": "0"
     }
     res = requests.get(url, headers=headers, params=params)
-    if res.status_code != 200 or res.json().get('rt_cd') != '0': return pd.DataFrame()
-    df = pd.DataFrame(res.json().get('output', []))
-    if df.empty: return df
-    df = df[['hts_kor_isnm', 'ntby_qty']]
-    df.columns = ['종목명', '수량']
-    df['수량'] = pd.to_numeric(df['수량'])
-    return df.head(10)
+    if res.status_code == 200:
+        data = res.json()
+        if data.get('rt_cd') == '0':
+            df = pd.DataFrame(data.get('output', []))
+            if not df.empty:
+                df = df[['hts_kor_isnm', 'ntby_qty']]
+                df.columns = ['종목명', '수량']
+                df['수량'] = pd.to_numeric(df['수량'])
+                return df, ""
+        # 🚨 에러 시 증권사의 원본 거절 메시지를 리턴
+        return pd.DataFrame(), data.get('msg1', '조회된 데이터가 없습니다.')
+    return pd.DataFrame(), f"HTTP 에러: {res.status_code}"
 
 @st.cache_data(ttl=600)
 def get_dual_macro_data(token, app_key, app_secret, start_date, end_date):
@@ -46,21 +52,22 @@ def get_dual_macro_data(token, app_key, app_secret, start_date, end_date):
         "appkey": app_key, "appsecret": app_secret, "tr_id": "FHKST01010900", "custtype": "P"
     }
     def fetch_stock(code, name):
+        time.sleep(0.6) # 🚨 방어막: 0.6초 대기
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
         res = requests.get(url, headers=headers, params=params)
         if res.status_code == 200 and res.json().get('rt_cd') == '0':
             df = pd.DataFrame(res.json().get('output', []))
-            df = df[['stck_bsop_date', 'frgn_ntby_qty', 'orgn_ntby_qty', 'prsn_ntby_qty']]
-            df.columns = ['날짜', f'{name}_외국인', f'{name}_기관', f'{name}_개인']
-            df['날짜'] = pd.to_datetime(df['날짜'])
-            df[f'{name}_외국인'] = pd.to_numeric(df[f'{name}_외국인'])
-            df[f'{name}_기관'] = pd.to_numeric(df[f'{name}_기관'])
-            df[f'{name}_개인'] = pd.to_numeric(df[f'{name}_개인'])
-            return df.set_index('날짜')
+            if not df.empty:
+                df = df[['stck_bsop_date', 'frgn_ntby_qty', 'orgn_ntby_qty', 'prsn_ntby_qty']]
+                df.columns = ['날짜', f'{name}_외국인', f'{name}_기관', f'{name}_개인']
+                df['날짜'] = pd.to_datetime(df['날짜'])
+                df[f'{name}_외국인'] = pd.to_numeric(df[f'{name}_외국인'])
+                df[f'{name}_기관'] = pd.to_numeric(df[f'{name}_기관'])
+                df[f'{name}_개인'] = pd.to_numeric(df[f'{name}_개인'])
+                return df.set_index('날짜')
         return pd.DataFrame()
 
     df_sam = fetch_stock("005930", "삼성전자")
-    time.sleep(0.5) # 🚨 핵심 패치: 한투 API 초당 호출 횟수 제한(Rate Limit) 방어용 숨 고르기
     df_hy = fetch_stock("000660", "하이닉스")
     
     df_usd = fdr.DataReader('USD/KRW', start_date, end_date)[['Close']]
@@ -83,6 +90,7 @@ def get_dual_macro_data(token, app_key, app_secret, start_date, end_date):
 
 @st.cache_data(ttl=60)
 def get_intraday_data(token, app_key, app_secret, stock_code):
+    time.sleep(0.6) # 🚨 방어막: 초당 1건 제한(Rate Limit) 회피
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-investor"
     headers = {
         "content-type": "application/json; charset=utf-8",
@@ -94,30 +102,28 @@ def get_intraday_data(token, app_key, app_secret, stock_code):
     params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": stock_code}
     res = requests.get(url, headers=headers, params=params)
     
-    if res.status_code == 200 and res.json().get('rt_cd') == '0':
-        data = res.json().get('output', [])
-        if not data: return pd.DataFrame()
-        
-        df = pd.DataFrame(data)
-        try:
-            df = df[['stck_cntg_hour', 'frgn_ntby_qty', 'orgn_ntby_qty']]
-            df.columns = ['시간', '외국인', '기관']
-            
-            df = df[df['시간'] != ""]
-            df['시간'] = pd.to_datetime(df['시간'], format='%H%M%S').dt.strftime('%H:%M')
-            df['외국인'] = pd.to_numeric(df['외국인'])
-            df['기관'] = pd.to_numeric(df['기관'])
-            
-            df = df.sort_values('시간').reset_index(drop=True)
-            return df
-        except KeyError:
-            return pd.DataFrame()
-    return pd.DataFrame()
+    if res.status_code == 200:
+        data = res.json()
+        if data.get('rt_cd') == '0':
+            out = data.get('output', [])
+            if out:
+                df = pd.DataFrame(out)
+                df = df[['stck_cntg_hour', 'frgn_ntby_qty', 'orgn_ntby_qty']]
+                df.columns = ['시간', '외국인', '기관']
+                df = df[df['시간'] != ""]
+                df['시간'] = pd.to_datetime(df['시간'], format='%H%M%S').dt.strftime('%H:%M')
+                df['외국인'] = pd.to_numeric(df['외국인'])
+                df['기관'] = pd.to_numeric(df['기관'])
+                df = df.sort_values('시간').reset_index(drop=True)
+                return df, ""
+        # 🚨 에러 시 증권사의 원본 거절 메시지를 리턴
+        return pd.DataFrame(), data.get('msg1', '데이터 없음')
+    return pd.DataFrame(), f"HTTP 에러: {res.status_code}"
 
 
 # --- 2. 프론트엔드 UI ---
 st.set_page_config(page_title="KOSPI Security Dashboard", layout="wide")
-st.title("🐳 KOSPI 올인원 관제 센터 v14.1")
+st.title("🐳 KOSPI 올인원 관제 센터 v14.3")
 
 if 'saved_key' not in st.session_state: st.session_state.saved_key = ""
 if 'saved_secret' not in st.session_state: st.session_state.saved_secret = ""
@@ -135,7 +141,7 @@ else:
 
 st.sidebar.markdown("---")
 
-if st.sidebar.button("🔄 최신 데이터 강제 새로고침"):
+if st.sidebar.button("🔄 최신 데이터 강제 새로고침 (클릭 시 3초 소요)"):
     st.cache_data.clear()
     st.rerun()
 
@@ -182,9 +188,8 @@ else:
             df_macro = get_dual_macro_data(token, user_app_key, user_app_secret, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
             
             if not df_macro.empty and selected_investors:
-                # 🚨 신규 안전망: Rate Limit으로 인해 데이터가 누락되었는지 검사
                 if '하이닉스_외국인' not in df_macro.columns or '삼성전자_외국인' not in df_macro.columns:
-                    st.error("⚠️ 증권사 서버 트래픽 제한(Rate Limit)으로 일부 종목이 누락되었습니다. 3초 후 [강제 새로고침] 버튼을 눌러주세요.")
+                    st.error("⚠️ 증권사 서버 트래픽 제한(Rate Limit)으로 일부 종목이 누락되었습니다. 좌측 [강제 새로고침]을 다시 눌러주세요.")
                 else:
                     for inv in ["외국인", "기관", "개인"]:
                         df_macro[f'하이닉스_환산_{inv}'] = df_macro[f'하이닉스_{inv}'] * hynix_ratio
@@ -205,9 +210,9 @@ else:
                         col_sam = f'삼성전자_{inv}'; col_hy_adj = f'하이닉스_환산_{inv}'
                         is_selling = (latest[col_sam] <= sell_threshold) or (latest[col_hy_adj] <= sell_threshold)
                         if is_selling:
-                            if inv == "외국인" and is_fx_spiking: st.error(f"🚨 **[{inv}] 자본 이탈 경보:** 대장주 대규모 매도 및 환율 급등 포착!")
-                            else: st.warning(f"⚠️ **[{inv}] 대량 매도:** 대장주 대규모 매도세가 진행 중입니다.")
-                        else: st.info(f"🟢 **[{inv}] 안전/관망:** 뚜렷한 리스크 시그널 없음.")
+                            if inv == "외국인" and is_fx_spiking: st.error(f"🚨 **[{inv}] 자본 이탈 경보:** 대장주 매도 및 환율 급등!")
+                            else: st.warning(f"⚠️ **[{inv}] 대량 매도:** 대장주 매도세 진행 중")
+                        else: st.info(f"🟢 **[{inv}] 안전/관망:** 뚜렷한 리스크 시그널 없음")
                     
                     fig_macro = go.Figure()
                     color_map = {"외국인": ('#4169E1', '#CD5C5C'), "기관": ('#2E8B57', '#8A2BE2'), "개인": ('#FF8C00', '#DAA520')}
@@ -234,7 +239,6 @@ else:
         # ==========================================
         with tab_ranking:
             st.markdown("선택한 주체의 당일 매수 상위 종목과 매도 상위 종목을 동시에 비교 분석합니다.")
-            
             inv_sel = st.radio("👀 분석 주체 선택", ("외국인", "기관투자자"), horizontal=True)
             inv_code = "9000" if inv_sel == "외국인" else "9001"
             
@@ -243,25 +247,26 @@ else:
             
             with col_buy:
                 st.markdown(f"#### 🔥 {inv_sel} 순매수 TOP 10")
-                df_buy = get_ranking_data(token, user_app_key, user_app_secret, inv_code, "0")
+                # 🚨 엔진 수정 반영: 에러 원인 메시지까지 리턴받기
+                df_buy, msg_buy = get_ranking_data(token, user_app_key, user_app_secret, inv_code, "0")
                 if not df_buy.empty:
                     fig_buy = px.bar(df_buy, x='수량', y='종목명', orientation='h', text='수량')
                     fig_buy.update_layout(yaxis={'categoryorder': 'total ascending'}, plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=30, b=0))
                     fig_buy.update_traces(marker_color='#FF4B4B', texttemplate='%{text:,.0f} 주', textposition='outside')
                     st.plotly_chart(fig_buy, use_container_width=True)
                 else:
-                    st.warning("데이터가 없습니다.")
+                    st.warning(f"⚠️ 데이터 없음 (사유: {msg_buy})")
                     
             with col_sell:
                 st.markdown(f"#### 🧊 {inv_sel} 순매도 TOP 10")
-                df_sell = get_ranking_data(token, user_app_key, user_app_secret, inv_code, "1")
+                df_sell, msg_sell = get_ranking_data(token, user_app_key, user_app_secret, inv_code, "1")
                 if not df_sell.empty:
                     fig_sell = px.bar(df_sell, x='수량', y='종목명', orientation='h', text='수량')
                     fig_sell.update_layout(yaxis={'categoryorder': 'total ascending'}, plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=0, r=0, t=30, b=0))
                     fig_sell.update_traces(marker_color='#1F77B4', texttemplate='%{text:,.0f} 주', textposition='outside')
                     st.plotly_chart(fig_sell, use_container_width=True)
                 else:
-                    st.warning("데이터가 없습니다.")
+                    st.warning(f"⚠️ 데이터 없음 (사유: {msg_sell})")
 
         # ==========================================
         # 탭 3: 장중 실시간(잠정) 레이더
@@ -275,11 +280,12 @@ else:
             
             if st.button("📡 현재 시간 기준 레이더 재스캔 (수동 새로고침)"):
                 st.cache_data.clear()
+                st.rerun()
             
-            df_intra = get_intraday_data(token, user_app_key, user_app_secret, stock_code)
+            df_intra, msg_intra = get_intraday_data(token, user_app_key, user_app_secret, stock_code)
             
             if df_intra.empty:
-                st.warning("⚠️ 현재 집계된 장중 잠정 데이터가 없습니다. (정규장 오픈 전이거나, 휴장일입니다.)")
+                st.warning(f"⚠️ 장중 데이터가 없습니다. (사유: {msg_intra})")
             else:
                 st.markdown(f"#### 📊 {target_stock.split(' ')[0]} 당일 시간대별 누적 순매수 (잠정치)")
                 
@@ -296,10 +302,8 @@ else:
                 ))
                 
                 fig_intra.update_layout(
-                    xaxis_title="집계 시간",
-                    yaxis_title="누적 순매수 수량 (주)",
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    xaxis_title="집계 시간", yaxis_title="누적 순매수 수량 (주)",
+                    hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
                 )
                 fig_intra.update_traces(texttemplate='%{text:,.0f}')
                 st.plotly_chart(fig_intra, use_container_width=True)
